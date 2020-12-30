@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+
+# this is inspired by https://github.com/mnagel/gnome-keyring-dumper
+
+import sys
+import argparse
+import textwrap
+import re
+import logging
+from logging import debug
+
+try:
+    import secretstorage
+except ModuleNotFoundError:
+    print("You need python module secretstorage, please install it.", file=sys.stderr)
+    print("(for Debian-based: sudo apt-get install python3-secretstorage)", file=sys.stderr)
+    sys.exit(1)
+
+
+class ExKeyringCleanup(Exception):
+    pass
+
+def get_regex_list(regex_list):
+    """
+    Check if all values in list are valid regexes
+    Return list or ExKeyringCleanup with error text
+    if regex_list is None, return empty list (not None)
+    """
+    rv = []
+    if regex_list is not None:
+        rv = regex_list
+    # check if regex'es are good
+    for exc in rv:
+        try:
+            re.compile(exc)
+        except re.error as e:
+            raise ExKeyringCleanup(f"Bad regexp '{exc}': {e}")
+    return rv
+
+
+def get_attr_regex_list(attr_regex_list):
+    """
+    Parse --include-attr and --exclude-attr formats
+    Return list of lists [ [ attr_name, attr_regex ], ... ]
+    if attr_regex_list is None, return empty list (not None)
+    raises ExKeyringCleanup exception on error
+    """
+    rv = []
+    if attr_regex_list is not None:
+        for exstr in attr_regex_list:
+            keyval = exstr.split(":",1)
+            if len(keyval) != 2:
+                raise ExKeyringCleanup(f"bad format for attr_name:regex pair: '{exstr}'")
+            try:
+                re.compile(keyval[1])
+            except re.error as e:
+                raise ExKeyringCleanup(f"Bad regexp '{keyval[1]}': {e}")
+            rv.append([keyval[0], keyval[1]])
+    return rv
+
+
+def is_label_matches(label, regex_list):
+    """
+    Check if label string matches one of regex_list
+    Return True if matches
+    If regex_list is empty - return False
+    """
+    for regex in regex_list:
+        if re.match(regex, label):
+            return True
+    return False
+
+
+def is_attr_matches(attr_list, attr_regex_list):
+    """
+    Check if any attribute from list matches one of pair attribute name-regex
+    Return True if matches
+    If attr_list or regex_list is empty - return False
+    If attribute name in list is empty then any attribute name matches
+    """
+    if not attr_list or not attr_regex_list:
+        return False
+    for attr in attr_list:
+        for keyval in attr_regex_list:
+            attr_name = keyval[0]
+            attr_regex = keyval[1]
+            if attr_name == '' or attr == attr_name:
+                if re.match(attr_regex, attr_list[attr]):
+                    return True
+    return False
+
+
+def is_item_matches_all(item, label_regex_list, attr_regex_list):
+    """
+    Check if keyring item matches both label_regex_list and attr_regex_list
+    Returns True or False
+    """
+    if is_label_matches(item.get_label(), label_regex_list):
+        if is_attr_matches(item.get_attributes(), attr_regex_list):
+            return True
+    return False
+
+
+def is_item_matches_any(item, label_regex_list, attr_regex_list):
+    """
+    Check if keyring item matches any of label_regex_list and attr_regex_list
+    Returns True or False
+    """
+    if is_label_matches(item.get_label(), label_regex_list):
+        return True
+    if is_attr_matches(item.get_attributes(), attr_regex_list):
+        return True
+    return False
+
+
+def unlock_keyring(keyring):
+    if keyring.is_locked():
+        keyring.unlock()
+        if keyring.is_locked():
+            raise ExKeyringCleanup(f"Failed to unlock keyring '{keyring.get_label()}'")
+
+
+def main():
+    do_clean = False
+    verbose = False
+    showsecrets = False
+
+    logging.basicConfig(level=logging.INFO)
+
+    # noinspection PyTypeChecker
+    parser = argparse.ArgumentParser(
+        description=f'Show GNOME keyring data or clean keyring of matching items',
+        epilog=textwrap.dedent('''\
+        If no -c option given, will show matching entries, -v and -s adds more output.
+        Note on --include-attr and --exclude-attr:
+          attrname is name of attribute (fixed string), if empty then any attribute matches
+        Note on regex usage:
+          to match any string, use .*
+          to make regex case-insensitive, use (?i)regex
+        '''),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('-c', dest='do_clean', default=False, action='store_true',
+                        help=f'Remove matching entries')
+    parser.add_argument('--include-label', dest='label_include', metavar='regex', type=str, nargs='+', default=['.*'],
+                        help=f'Skip if item label does not match regex')
+    parser.add_argument('--include-attr', dest='attr_include', metavar='attrname:val_regex', type=str, nargs='+',
+                        default=[':.*'],
+                        help=f'Skip if none of item attributes matches any of regex\'es')
+    parser.add_argument('--exclude-label', dest='label_exclude', metavar='regex', type=str, nargs='+',
+                        help=f'Skip if item label matches regex')
+    parser.add_argument('--exclude-attr', dest='attr_exclude', metavar='attrname:val_regex', type=str, nargs='+',
+                        help=f'Skip if any of item attributes matches any of regex\'es')
+    parser.add_argument('-v', dest='verbose', default=False, action='store_true',
+                        help=f'Add more output where appropriate')
+    parser.add_argument('-s', dest='showsecrets', default=False, action='store_true',
+                        help=f'Show secrets when listing entries')
+    parser.add_argument('-d', '--debug', default=False, action='store_true',
+                        help=f'Enable debugging output')
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        debug("enabled debug")
+
+    do_clean = args.do_clean
+    verbose = args.verbose
+    showsecrets = args.showsecrets
+
+    try:
+        label_include = get_regex_list(args.label_include)
+        attr_include = get_attr_regex_list(args.attr_include)
+        label_exclude = get_regex_list(args.label_exclude)
+        attr_exclude = get_attr_regex_list(args.attr_exclude)
+    except ExKeyringCleanup as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    debug(f"do_clean      = {do_clean}")
+    debug(f"verbose       = {verbose}")
+    debug(f"showsecrets   = {showsecrets}")
+    debug(f"label_include = {label_include}")
+    debug(f"attr_include  = {attr_include}")
+    debug(f"label_exclude = {label_exclude}")
+    debug(f"attr_exclude  = {attr_exclude}")
+
+    bus = secretstorage.dbus_init()
+
+    for keyring in secretstorage.get_all_collections(bus):
+        for item in keyring.get_all_items():
+            item_info = f"keyring '{keyring.get_label()}', label: '{item.get_label()}'"
+            if not is_item_matches_all(item, label_include, attr_include):
+                debug(f"skipped item: {item_info} because it does not match include criterias")
+                continue
+            if is_item_matches_any(item, label_exclude, attr_exclude):
+                debug(f"skipped item: {item_info} because it matches exclude criterias")
+                continue
+
+            if not do_clean:
+                # "show" mode
+                s = f"Item: {item_info}"
+                if showsecrets:
+                    try:
+                        unlock_keyring(keyring)
+                    except ExKeyringCleanup as e:
+                        print(str(e), file=sys.stderr)
+                        break
+                    if item.is_locked():
+                        item.unlock()
+                    try:
+                        secret = item.get_secret().decode("utf-8")
+                    except Exception as e:
+                        s = s + f", (failed to show secret: {e})"
+                    else:
+                        s = s + f", secret: '{secret}'"
+                print(s)
+                if verbose:
+                    attr = item.get_attributes()
+                    if len(attr):
+                        print(f"  Attributes:")
+                        for a in attr:
+                            print(f"    '{a}': '{attr[a]}'")
+                    else:
+                        print(f"  (no attributes in this entry)")
+            else:  # perform actual cleaning
+                print(f"cleaning item: {item_info}")
+                try:
+                    unlock_keyring(keyring)
+                except ExKeyringCleanup as e:
+                    print(str(e), file=sys.stderr)
+                    break
+                if item.is_locked():
+                    item.unlock()
+                item.delete()
+
+if __name__ == '__main__':
+    main()
+
+# vim:expandtab tabstop=8 shiftwidth=4 softtabstop=4
