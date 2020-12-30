@@ -8,6 +8,7 @@ import textwrap
 import re
 import logging
 from logging import debug
+import dbus.exceptions
 
 try:
     import secretstorage
@@ -184,7 +185,12 @@ def main():
     debug(f"label_exclude = {label_exclude}")
     debug(f"attr_exclude  = {attr_exclude}")
 
-    bus = secretstorage.dbus_init()
+    try:
+        bus = secretstorage.dbus_init()
+    except (dbus.exceptions.DBusException, secretstorage.exceptions.SecretServiceNotAvailableException) as e:
+        print(f"Failed to connect to dbus: {e}", file=sys.stderr)
+        print(f"Possible cause: you run this script not in the user's session", file=sys.stderr)
+        sys.exit(1)
 
     for keyring in secretstorage.get_all_collections(bus):
         for item in keyring.get_all_items():
